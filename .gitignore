@@ -1,5 +1,5 @@
-# Course material: never public (manuals, slides, handouts, textbook)
-*.pdf
+# Course material: never public (slides, handouts, textbook).
+# PDFs are NOT ignored: my own notes may be PDFs. Instructor PDFs must still never be added.
 *.ppt
 *.pptx
 *.doc
