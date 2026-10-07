@@ -1,0 +1,37 @@
+# Build every committed lab with the school VM's flags and run a loopback test.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lab2:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lab2/school
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (gnu89, warnings are errors)
+        run: make CFLAGS="-std=gnu89 -Wall -Wextra -Werror"
+
+      - name: Loopback test - server sends Hello, client prints it
+        run: |
+          ./build/hello_server 5000 &
+          sleep 1
+          ./build/hello_client 127.0.0.1 5000 | tee out.txt
+          grep -qx 'Hello' out.txt
+
+      - name: Error case - no server listening
+        run: |
+          if ./build/hello_client 127.0.0.1 5001; then
+            echo "expected connect to fail"; exit 1
+          fi
+
+      - name: Error case - too many arguments
+        run: |
+          if ./build/hello_client a b c; then
+            echo "expected usage error"; exit 1
+          fi

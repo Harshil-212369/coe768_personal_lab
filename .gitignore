@@ -1,0 +1,33 @@
+# Course material: never public (manuals, slides, handouts, textbook)
+*.pdf
+*.ppt
+*.pptx
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.one
+*.zip
+*.html
+
+# Packet captures (may contain other people's traffic)
+*.pcap
+*.pcapng
+
+# Build output: everything is built into build/
+build/
+*.o
+a.out
+
+# Editor and OS clutter
+*~
+*.swp
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets and Claude Code local files
+.env
+*.key
+.claude/settings.local.json
