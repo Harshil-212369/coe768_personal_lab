@@ -9,7 +9,8 @@ Disclaimer: Personal study copies, for my own understanding only. Not for submis
 | Lab | Topic | Folder |
 |---|---|---|
 | Lab 2 | TCP Hello server and client | [lab2/](lab2/) |
+| Lab 3 | TCP file download server and client | [lab3/](lab3/) |
 
-Each lab has two folders: `school/` is the version built for the school's Fedora lab VMs, and `homelab/` is my replication on my own network.
+Some labs have a `school/` folder (the version built for the school's Fedora lab VMs) and a `homelab/` folder (my replication on my own network); labs without a homelab version keep their own layout.
 
 Every push is built by GitHub Actions with `gcc -std=gnu89 -Wall -Wextra -Werror` and tested over loopback.
