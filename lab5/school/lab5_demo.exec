@@ -1,0 +1,424 @@
+#!/bin/bash
+# Origin: AI-assisted (Claude), reviewed by me
+# =============================================================================
+#  lab5_demo.exec  -  COE768 Lab 5: live RIP failover demo for the TA
+#  Version: 2026-11-20 v1
+#
+#  Run AFTER lab5_setup.exec has started zebra + ripd on this router.
+#  Every terminal: type  su -   (full root login, so /sbin works), then:
+#
+#      bash lab5_demo.exec <ROUTER> <ROLE>
+#
+#  ROLES (one terminal each, in this order):
+#      guide      print the whole demo sequence for this router (start here)
+#      check      Terminal 3: confirm daemons + normal (shortest) path
+#      capture    Terminal 2: tcpdump on the BACKUP interface, saved to file
+#      ping       Terminal 1: ping the farthest router (leave running)
+#      fail       Terminal 3: bring the primary interface DOWN, time the failover
+#      recover    Terminal 3: bring it back UP, time the reconvergence
+#      summary    any terminal, after Ctrl+C on capture: RIP timeline + intervals
+#      wireshark  print the Wireshark steps (for Monday)
+#
+#  NOTE: zebra and ripd run in the background (-d). Closing the terminal that
+#  ran lab5_setup.exec does NOT stop them, and the routing stays in place.
+#  Restarting the VM DOES wipe everything (/demo_lab5 and the daemons).
+#
+#  Manual references ("Lab 4 and Lab 5-COE768.pdf", Lab 5, printed p.13):
+#    step 10 "Observe the RIP interval."
+#    step 13 "Disconnect the router's interface that is used in routing
+#             packets to the farthest router ... Identify RIP phases in the trace."
+#    step 14 "Reconnect the interface ... Identify RIP convergence phases."
+# ============================================================================
+
+VERSION="2026-11-20 v1"
+STEP_DELAY=2              # seconds between numbered steps (narration pause)
+DEMO_DIR=/demo_lab5       # created by lab5_setup.exec
+
+# ---- Absolute paths (no reliance on PATH) ----------------------------------
+IFCONFIG=/sbin/ifconfig
+ROUTE=/sbin/route
+TCPDUMP=/usr/sbin/tcpdump
+PING=/bin/ping
+PGREP=/usr/bin/pgrep
+TEE=/usr/bin/tee
+TRACEROUTE=""
+for t in /bin/traceroute /usr/bin/traceroute /usr/sbin/traceroute; do
+    if [ -x "$t" ]; then TRACEROUTE="$t"; break; fi
+done
+
+step() {
+    echo
+    echo "==================== $1 ===================="
+    sleep "$STEP_DELAY"
+}
+
+need() {   # need <binary> : stop with a clear message if it is missing
+    if [ ! -x "$1" ]; then
+        echo "ERROR: $1 not found on this VM."
+        exit 1
+    fi
+}
+
+usage() {
+    echo "Usage:  bash lab5_demo.exec <ROUTER> <ROLE>"
+    echo "  ROUTER: R5 R6 R7 R8 (cluster 2) or R9 R10 R11 R12 (cluster 3)"
+    echo "  ROLE:   guide | check | capture | ping | fail | recover | summary | wireshark"
+    echo "Example: bash lab5_demo.exec R5 guide"
+}
+
+echo "lab5_demo.exec  version $VERSION"
+
+# ---- Argument checks --------------------------------------------------------
+if [ $# -ne 2 ]; then
+    echo "ERROR: need exactly 2 arguments (router and role)."
+    usage
+    exit 1
+fi
+ROUTER="$1"
+ROLE="$2"
+
+# ---- Demo table: farthest-router target and which interface carries it -------
+# TARGET  = an IP on the farthest router, on a subnet ONE router past your
+#           neighbour, so there is a unique shortest path (metric 2 vs 3).
+# PRIMARY = interface used by the shortest path  (this is the one we bring down)
+# BACKUP  = interface the traffic moves to       (this is where we capture)
+case "$ROUTER" in
+    R5)  TARGET=10.2.2.1; PRIMARY=eth0; BACKUP=eth1; FAR=R7  ;;
+    R6)  TARGET=10.2.1.1; PRIMARY=eth1; BACKUP=eth0; FAR=R8  ;;
+    R7)  TARGET=10.2.1.2; PRIMARY=eth1; BACKUP=eth0; FAR=R5  ;;
+    R8)  TARGET=10.2.4.2; PRIMARY=eth0; BACKUP=eth1; FAR=R6  ;;
+    # Cluster 3 uses the class .exec files (eth2 for the second ring link).
+    # Check the wiring first: ping each neighbour on each link.
+    R9)  TARGET=10.3.3.1; PRIMARY=eth2; BACKUP=eth0; FAR=R11 ;;
+    R10) TARGET=10.3.3.2; PRIMARY=eth2; BACKUP=eth0; FAR=R12 ;;
+    R11) TARGET=10.3.1.1; PRIMARY=eth2; BACKUP=eth0; FAR=R9  ;;
+    R12) TARGET=10.3.4.1; PRIMARY=eth0; BACKUP=eth2; FAR=R10 ;;
+    *)
+        echo "ERROR: router '$ROUTER' is not in the demo table."
+        usage
+        exit 1
+        ;;
+esac
+SUBNET="${TARGET%.*}.0"          # e.g. 10.2.2.1 -> 10.2.2.0
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: run as root. Type:  su -   then run this again."
+    exit 1
+fi
+
+# ---- Helpers -----------------------------------------------------------------
+# The routing-table line for the target subnet (empty if no route).
+route_line() {
+    "$ROUTE" -n | awk -v s="$SUBNET" '$1 == s'
+}
+# Which interface the target subnet uses right now (empty if no route).
+route_iface() {
+    route_line | awk '{print $8}' | head -1
+}
+show_route() {
+    local line
+    line="$(route_line)"
+    if [ -z "$line" ]; then
+        echo "  $SUBNET : NO ROUTE (routing hole)"
+    else
+        echo "$line" | awk '{printf "  %s via %s  metric %s  out %s\n", $1, $2, $5, $8}'
+    fi
+}
+do_traceroute() {
+    if [ -n "$TRACEROUTE" ]; then
+        "$TRACEROUTE" -n "$TARGET"
+    else
+        echo "(traceroute not installed on this VM - skipping)"
+    fi
+}
+# This router's own IP on an interface (works with old and new ifconfig output).
+iface_ip() {
+    "$IFCONFIG" "$1" 2>/dev/null \
+      | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p; s/.*inet \([0-9][0-9.]*\) .*/\1/p' \
+      | head -1
+}
+
+# ============================================================================
+case "$ROLE" in
+
+# ----------------------------------------------------------------------------
+guide)
+    cat <<EOF
+
+LAB 5 DEMO for $ROUTER   (farthest router: $FAR, target IP: $TARGET)
+  Shortest path leaves on $PRIMARY.  Backup path leaves on $BACKUP.
+
+Open 3 terminals. In EACH one type:  su -
+
+  TERMINAL 3 (control):  bash lab5_demo.exec $ROUTER check
+        -> must say READY before you continue.
+  TERMINAL 2 (capture):  bash lab5_demo.exec $ROUTER capture
+        -> leave it running. Only RIP lines should appear (no ICMP yet).
+  TERMINAL 1 (traffic):  bash lab5_demo.exec $ROUTER ping
+        -> leave it running. Still no ICMP in Terminal 2.
+  TERMINAL 3:            bash lab5_demo.exec $ROUTER fail
+        -> watch: metric 16 in Terminal 2, "Network is unreachable" in
+           Terminal 1, then ICMP appears in Terminal 2 (backup path).
+  wait ~30 s, then
+  TERMINAL 3:            bash lab5_demo.exec $ROUTER recover
+        -> ICMP stops in Terminal 2 (traffic back on $PRIMARY).
+  TERMINAL 1:  Ctrl+C   (read the loss summary aloud: lost pings ~= seconds of outage)
+  TERMINAL 2:  Ctrl+C   (capture saved, file name is printed)
+  TERMINAL 3:            bash lab5_demo.exec $ROUTER summary
+
+Total time: about 2-3 minutes.
+Closing a terminal does not stop zebra/ripd. Restarting the VM wipes everything.
+EOF
+    ;;
+
+# ----------------------------------------------------------------------------
+check)
+    need "$IFCONFIG"; need "$ROUTE"; need "$PGREP"
+
+    step "1) Are zebra and ripd running?"
+    ok=1
+    for d in zebra ripd; do
+        if "$PGREP" -x "$d" > /dev/null; then
+            echo "  OK: $d is running"
+        else
+            echo "  TROUBLESHOOT: $d is NOT running -> run lab5_setup.exec first"
+            ok=0
+        fi
+    done
+    [ "$ok" -eq 1 ] || exit 1
+    echo "  (They run in the background: closing the setup terminal did not stop them.)"
+
+    step "2) Make sure the primary interface $PRIMARY is up"
+    "$IFCONFIG" "$PRIMARY" up
+
+    step "3) Wait for the shortest path to $SUBNET via $PRIMARY (max 60 s)"
+    waited=0
+    while [ "$(route_iface)" != "$PRIMARY" ] && [ "$waited" -lt 60 ]; do
+        show_route
+        sleep 5
+        waited=$((waited + 5))
+    done
+    show_route
+    if [ "$(route_iface)" != "$PRIMARY" ]; then
+        echo "  TROUBLESHOOT: route to $SUBNET is not via $PRIMARY after 60 s."
+        echo "  Are the neighbours' zebra and ripd running? Is the cable patched?"
+        exit 1
+    fi
+
+    step "4) Baseline routing table (manual step 9)"
+    "$ROUTE" -n
+
+    step "5) Baseline path to $FAR"
+    do_traceroute
+
+    echo
+    echo "READY. Shortest path to $TARGET leaves on $PRIMARY."
+    echo "Next: Terminal 2 ->  bash lab5_demo.exec $ROUTER capture"
+    ;;
+
+# ----------------------------------------------------------------------------
+capture)
+    need "$TCPDUMP"; need "$TEE"
+    if [ ! -d "$DEMO_DIR" ]; then
+        echo "ERROR: $DEMO_DIR does not exist. Run lab5_setup.exec first."
+        exit 1
+    fi
+    if [ "$(route_iface)" != "$PRIMARY" ]; then
+        echo "WARNING: traffic is not on $PRIMARY right now, so the capture will"
+        echo "not start in the normal state. Run 'check' in Terminal 3 first."
+        read -p "Press Ctrl+C to stop, or Enter to capture anyway... "
+    fi
+
+    # New file name with the current time, so the TA can see it is fresh.
+    FILE="$DEMO_DIR/capture_${ROUTER}_$(date +%H%M%S).txt"
+    echo "$FILE" > "$DEMO_DIR/LATEST_CAPTURE"
+
+    echo
+    echo "Capturing on $BACKUP (the BACKUP side) -> $FILE"
+    echo "Expect: only RIP lines now. ICMP appears here only after 'fail'."
+    echo "Press Ctrl+C when the demo is finished."
+    echo
+    # -l line-buffered (lines appear live through the pipe)
+    # -s 0 whole packet (no [|rip] truncation)   -n no DNS   -vv full RIP entries
+    trap 'true' INT
+    "$TCPDUMP" -l -s 0 -n -vv -i "$BACKUP" udp port 520 or icmp | "$TEE" "$FILE"
+    trap - INT
+    echo
+    echo "Capture saved: $FILE  ($(wc -l < "$FILE") lines)"
+    echo "Next (Terminal 3):  bash lab5_demo.exec $ROUTER summary"
+    ;;
+
+# ----------------------------------------------------------------------------
+ping)
+    need "$PING"
+    echo "Pinging $FAR at $TARGET. Leave this running."
+    echo "Press Ctrl+C at the end and read the statistics lines to the TA."
+    echo
+    trap 'true' INT
+    "$PING" "$TARGET"
+    trap - INT
+    echo
+    echo "Lost pings ~= seconds of outage (one ping per second)."
+    ;;
+
+# ----------------------------------------------------------------------------
+fail)
+    need "$IFCONFIG"; need "$ROUTE"
+    if [ "$(route_iface)" != "$PRIMARY" ]; then
+        echo "WARNING: route to $SUBNET is not via $PRIMARY. Was it already failed?"
+        echo "Run 'recover' or 'check' first."
+        exit 1
+    fi
+
+    step "13a) Before: shortest path"
+    show_route
+
+    step "13b) Disconnect: /sbin/ifconfig $PRIMARY down"
+    T0=$(date +%s)
+    echo "  $(date +%H:%M:%S)  $PRIMARY DOWN"
+    "$IFCONFIG" "$PRIMARY" down
+
+    echo
+    echo "  Watching the route to $SUBNET every 2 s (max 60 s):"
+    while :; do
+        now=$(( $(date +%s) - T0 ))
+        printf "  t=%2ss  " "$now"
+        show_route | sed 's/^  //'
+        if [ "$(route_iface)" = "$BACKUP" ]; then
+            echo "  -> BACKUP route installed after about ${now} s."
+            break
+        fi
+        if [ "$now" -ge 60 ]; then
+            echo "  TROUBLESHOOT: no backup route after 60 s."
+            echo "  Is the neighbour on $BACKUP running ripd?"
+            break
+        fi
+        sleep 2
+    done
+
+    step "13c) Routing table now"
+    "$ROUTE" -n
+
+    step "13d) New path to $FAR"
+    do_traceroute
+
+    echo
+    echo "Phases to point at: poison (metric 16) in the capture, routing hole"
+    echo "('Network is unreachable' in the ping), backup route via $BACKUP."
+    echo "Next: wait ~30 s, then  bash lab5_demo.exec $ROUTER recover"
+    ;;
+
+# ----------------------------------------------------------------------------
+recover)
+    need "$IFCONFIG"; need "$ROUTE"
+
+    step "14a) Reconnect: /sbin/ifconfig $PRIMARY up"
+    T0=$(date +%s)
+    echo "  $(date +%H:%M:%S)  $PRIMARY UP"
+    "$IFCONFIG" "$PRIMARY" up
+
+    echo
+    echo "  Watching the route to $SUBNET every 2 s (max 60 s):"
+    while :; do
+        now=$(( $(date +%s) - T0 ))
+        printf "  t=%2ss  " "$now"
+        show_route | sed 's/^  //'
+        if [ "$(route_iface)" = "$PRIMARY" ]; then
+            echo "  -> SHORTEST route back after about ${now} s."
+            break
+        fi
+        if [ "$now" -ge 60 ]; then
+            echo "  TROUBLESHOOT: shortest route not back after 60 s."
+            break
+        fi
+        sleep 2
+    done
+
+    step "14b) Routing table now"
+    "$ROUTE" -n
+
+    step "14c) Path to $FAR"
+    do_traceroute
+
+    echo
+    echo "Next: Ctrl+C in Terminal 1 (ping), then Ctrl+C in Terminal 2 (capture),"
+    echo "then  bash lab5_demo.exec $ROUTER summary"
+    ;;
+
+# ----------------------------------------------------------------------------
+summary)
+    FILE=""
+    [ -f "$DEMO_DIR/LATEST_CAPTURE" ] && FILE="$(cat "$DEMO_DIR/LATEST_CAPTURE")"
+    if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+        echo "ERROR: no capture file found. Run 'capture' first."
+        exit 1
+    fi
+    MYIP="$(iface_ip "$BACKUP")"
+    echo "Capture file : $FILE  ($(wc -l < "$FILE") lines)"
+    echo "My IP on $BACKUP : ${MYIP:-unknown}"
+
+    step "A) RIP timeline (every RIP Response, with its route entries)"
+    awk -v me="$MYIP" '
+        /224\.0\.0\.9\.router/ {
+            split($0, f, " "); t = f[1];
+            src = $0; sub(/.*\) /, "", src); sub(/\.router >.*/, "", src);
+            tag = (src == me) ? "  <- ME" : "";
+            printf "%s  from %s%s\n", t, src, tag; next
+        }
+        /AFI: IPv4:/ {
+            p = $0; sub(/.*IPv4: */, "", p); sub(/,.*/, "", p);
+            m = $0; sub(/.*metric: /, "", m); sub(/,.*/, "", m);
+            flag = (m == "16") ? "   <== POISON (unreachable)" : "";
+            printf "            %-18s metric %s%s\n", p, m, flag
+        }' "$FILE"
+
+    step "B) ICMP on the backup side ($BACKUP)"
+    first=$(grep -m1 "echo request" "$FILE" | awk '{print $1}')
+    last=$(grep "echo request" "$FILE" | tail -1 | awk '{print $1}')
+    count=$(grep -c "echo request" "$FILE")
+    if [ "$count" -eq 0 ]; then
+        echo "  No ICMP on $BACKUP (traffic never used the backup path)."
+    else
+        echo "  First ping on backup path : $first"
+        echo "  Last ping on backup path  : $last"
+        echo "  Echo requests on $BACKUP   : $count"
+    fi
+
+    step "C) RIP interval (manual step 10): gaps between updates per sender"
+    awk '
+        /224\.0\.0\.9\.router/ {
+            split($1, h, ":"); s = h[1]*3600 + h[2]*60 + h[3];
+            src = $0; sub(/.*\) /, "", src); sub(/\.router >.*/, "", src);
+            if (src in prev) gaps[src] = gaps[src] sprintf(" %.0f", s - prev[src]);
+            prev[src] = s
+        }
+        END {
+            for (k in gaps) printf "  %-12s gaps (s):%s\n", k, gaps[k];
+            print "  (gaps under ~10 s are triggered updates, not periodic ones)"
+        }' "$FILE"
+    ;;
+
+# ----------------------------------------------------------------------------
+wireshark)
+    cat <<EOF
+
+WIRESHARK (Monday) for $ROUTER
+  1) Start Wireshark from the menu (as root if it asks).
+  2) Capture -> Interfaces -> Start next to $BACKUP   (the BACKUP side).
+  3) Filter box:  rip || icmp      -> Apply
+  4) View -> Time Display Format -> Seconds Since Previous Displayed Packet
+     (the Time column then shows the RIP interval directly).
+  5) Run 'check', 'ping', 'fail', 'recover' in the terminals as usual.
+  6) Look for: Response from your own IP with Metric 16 (poison), then ICMP.
+  7) Stop -> File -> Save As (.pcap). Never open a .txt export in Wireshark.
+  Keep the tcpdump 'capture' role as the fallback if Wireshark misbehaves.
+EOF
+    ;;
+
+# ----------------------------------------------------------------------------
+*)
+    echo "ERROR: unknown role '$ROLE'."
+    usage
+    exit 1
+    ;;
+esac

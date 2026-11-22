@@ -1,0 +1,231 @@
+#!/bin/bash
+# Origin: AI-assisted (Claude), reviewed by me
+# =============================================================================
+#  lab5_setup.exec  -  COE768 Lab 5 (RIP) router setup
+#  Version: 2026-11-19 v1
+#
+#  Run as root (type: su) from any folder:
+#      bash lab5_setup.exec R11
+#  $1 = the router you are sitting at (R1 ... R20). It goes into zebra.conf
+#       as "hostname R11", so the same script works on any cluster.
+#
+#  Manual quotes are from "Lab 4 and Lab 5-COE768.pdf", Lab 5 section:
+#    printed page 12 = PDF page 13 (steps 1-6)
+#    printed page 13 = PDF page 14 (steps 7-14)
+#  Everything is created in /demo_lab5 (absolute paths), so it does not
+#  matter which folder you are in when you run this.
+# ============================================================================
+
+VERSION="2026-11-19 v1"
+
+# Print a numbered step, then pause 3 s so you can read / narrate it.
+step() {
+    echo
+    echo "==================== $1 ===================="
+    sleep 3
+}
+
+echo "lab5_setup.exec  version $VERSION"
+
+# ---- Argument and permission checks (stop early, with a clear message) ----
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: run this as root. Type: su   (then run the script again)"
+    exit 1
+fi
+
+case "$1" in
+    R[1-9]|R1[0-9]|R20) ROUTER="$1" ;;
+    *)
+        echo "ERROR: tell me which router you are on (R1 to R20)."
+        echo "Usage:   bash lab5_setup.exec R11"
+        exit 1
+        ;;
+esac
+echo "Setting up router: $ROUTER"
+
+
+# ----------------------------------------------------------------------------
+step "1) cd /"
+# Start from the top of the file system so the folder below is /demo_lab5.
+cd /
+
+
+# ----------------------------------------------------------------------------
+step "2) mkdir /demo_lab5"
+# Manual step 4 (p.12): "Keep all configuration files in your directory."
+# -p : no error if the folder already exists (safe to re-run the script).
+# chmod 777 : zebra/ripd may run as user "quagga"; they must be able to
+#             write their log file into this folder.
+mkdir -p /demo_lab5
+chmod 777 /demo_lab5
+cd /demo_lab5
+echo "Now in: $(pwd)"
+
+
+# ----------------------------------------------------------------------------
+step "3) gedit IPaddr.exec"
+# Manual step 1 (p.12): "Configure the interfaces of your router with the
+#   address, subnet mask (24-bit) and broadcast address as shown in the figure."
+# Paste ONLY the first lines of the class config (class_configs/) for this router:
+#   echo 1 > /proc/sys/net/ipv4/ip_forward
+#   /sbin/ifconfig ... up      (and any "/sbin/ifconfig ethX down" line)
+# Do NOT paste any "/sbin/route add" line: those are Lab 4 static routes.
+# In Lab 5, RIP must learn those routes by itself.
+echo "Paste ONLY the 'echo 1 > ...' line and the '/sbin/ifconfig' lines."
+echo "Do NOT paste any 'route add' lines. Save, then close gedit."
+gedit IPaddr.exec
+# gedit sometimes returns immediately (when another gedit window is open),
+# so wait here until you confirm you have saved the file.
+read -p "Press Enter AFTER you have saved IPaddr.exec and closed gedit... "
+
+if [ ! -s IPaddr.exec ]; then
+    echo "ERROR: IPaddr.exec is missing or empty. Run the script again."
+    exit 1
+fi
+if grep -q 'route add' IPaddr.exec; then
+    echo "ERROR: IPaddr.exec still has 'route add' lines (Lab 4 static routes)."
+    echo "Delete them, save, and run the script again."
+    exit 1
+fi
+
+
+# ----------------------------------------------------------------------------
+step "4) chmod +x IPaddr.exec, then ./IPaddr.exec"
+# Same as Lab 4: give the file permission to run, then run it.
+chmod +x IPaddr.exec
+./IPaddr.exec
+
+# Lab 4, Section 3, step 2 (printed p.5): "Remove default route ... using
+#   command route delete default."
+# Why here: "redistribute kernel" in ripd.conf would advertise a default
+# route to every other router. 2>/dev/null hides the error message
+# "No such process" when there is no default route to delete.
+route del default 2>/dev/null
+
+# Manual step 2 (p.12): "Check your configuration by running the
+#   commands /sbin/ifconfig."
+/sbin/ifconfig
+echo
+echo "Routing table right now (expect ONLY 'U' lines = directly connected):"
+route -n
+
+# A 'UG' line now means a static route is still in the kernel (from Lab 4
+# or the previous user). It would override RIP, so warn before going on.
+if route -n | grep -q ' UG'; then
+    echo
+    echo "WARNING: 'UG' routes are still in the table (static routes)."
+    echo "They will override RIP. Restart the VM, or delete them with:"
+    echo "   route del -net <Destination> netmask <Genmask> gw <Gateway>"
+    read -p "Press Ctrl+C to stop, or Enter to continue anyway... "
+fi
+
+
+# ----------------------------------------------------------------------------
+step "5) Create /demo_lab5/zebra.conf"
+# Manual step 5 (p.12): "Prepare a configuration file for zebra as
+#   zebra.conf, which must contain the following configuration commands"
+# Only change from the manual: hostname = this router, and the log file uses
+# an absolute path (/demo_lab5/...) instead of the manual's relative
+# "coe768xy/zebra.log".
+cat > /demo_lab5/zebra.conf <<EOF
+hostname $ROUTER
+password zebra
+enable password zebra
+log file /demo_lab5/zebra.log
+EOF
+echo "--- /demo_lab5/zebra.conf ---"
+cat /demo_lab5/zebra.conf
+
+
+# ----------------------------------------------------------------------------
+step "6) Create /demo_lab5/ripd.conf"
+# Manual step 6 (p.12): "Prepare a configuration file for ripd as
+#   ripd.conf, which must contain the following commands"
+# Changes from the manual:
+#  - "passive-interface eth0" is REMOVED (TA email, Nov 15). With the class
+#    wiring, eth0 is a ring link on every router in the cluster. Passive =
+#    receive but never send, so the cluster would split in two.
+#  - "password zebra" is ADDED so "telnet localhost 2602" (ripd's own
+#    prompt: show ip rip, show ip rip status) lets you log in.
+cat > /demo_lab5/ripd.conf <<'EOF'
+password zebra
+router rip
+ network 10.0.0.0/8
+ redistribute kernel
+EOF
+echo "--- /demo_lab5/ripd.conf ---"
+cat /demo_lab5/ripd.conf
+
+
+# ----------------------------------------------------------------------------
+step "7) Clean out old zebra/ripd (safe even if none are running)"
+# Manual step 7 (p.13): "If Zebra cannot be run, use the following command
+#   to add Zebra to your working path: $export PATH=/usr/sbin:$PATH"
+# This only affects this script. In your own terminal, type it again
+# (or use /usr/sbin/tcpdump etc.).
+export PATH=/usr/sbin:$PATH
+# Manual Section 4 Troubleshooting (p.13): "$pkill zebra  $pkill ripd"
+# pkill prints nothing if nothing is running.
+pkill zebra
+pkill ripd
+sleep 1
+# Manual Section 4 Troubleshooting (p.13): "$rm -rf /var/run/quagga/zebra.pid"
+# -f means: no error if the file does not exist.
+rm -f /var/run/quagga/zebra.pid /var/run/quagga/ripd.pid
+
+
+# ----------------------------------------------------------------------------
+step "8a) Start zebra"
+# Manual step 7 (p.13): "Start zebra daemon as zebra -df
+#   coe768xy/zebra.conf from the home directory."
+#   -d = run in the background (daemon)
+#   -f = which config file to read
+# Manual tip (p.13): "Running zebra is mandatory to run ripd. Thus, keep
+#   the above sequence in running the software."
+zebra -df /demo_lab5/zebra.conf
+sleep 2
+if pgrep -x zebra > /dev/null; then
+    echo "OK: zebra is running."
+else
+    echo "TROUBLESHOOT: zebra is NOT running."
+    echo "Log file says:"
+    cat /demo_lab5/zebra.log 2>/dev/null || echo "(no log file was created)"
+    echo "If it says 'Could not lock pid_file', see manual Section 4 (p.13)."
+    exit 1
+fi
+
+
+# ----------------------------------------------------------------------------
+step "8b) Start ripd"
+# Manual step 8 (p.13): "Start ripd as ripd -df coe768xy/ripd.conf
+#   from the home directory."
+ripd -df /demo_lab5/ripd.conf
+sleep 2
+if pgrep -x ripd > /dev/null; then
+    echo "OK: ripd is running."
+else
+    echo "TROUBLESHOOT: ripd is NOT running."
+    echo "Check that zebra is still running:  ps aux | grep zebra"
+    exit 1
+fi
+
+
+# ----------------------------------------------------------------------------
+step "9) route -n (after waiting for RIP updates)"
+# Manual step 9 (p.13): "Run route -n on all of the routers in your subnet
+#   and observe the routing table."
+# RIP routers send updates about every 30 s, and your neighbours must be
+# running ripd too. Wait 40 s before looking.
+echo "Waiting 40 s for RIP updates from your neighbours..."
+sleep 40
+route -n
+echo
+echo "EXPECT: new 'UG' lines for the subnets you are NOT connected to,"
+echo "        learned from RIP (you never typed them)."
+echo "IF you still see only 'U' lines:"
+echo "  1) Are your neighbours' zebra AND ripd running?"
+echo "  2) Can you ping each neighbour's IP on each link?"
+echo "  3) Firewall: run 'iptables -L -n'. If you see REJECT lines: 'iptables -F'"
+echo "  4) Run 'route -n' again in 30 s."
+echo
+echo "Setup done ($VERSION). Next: manual step 10 (Wireshark), then pings."
