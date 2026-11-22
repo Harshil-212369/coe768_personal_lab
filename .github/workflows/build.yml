@@ -35,3 +35,11 @@ jobs:
           if ./build/hello_client a b c; then
             echo "expected usage error"; exit 1
           fi
+
+  lab5:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check the RIP scripts (bash -n parses without running)
+        run: for f in lab5/school/*.exec; do bash -n "$f" && echo "$f OK"; done
