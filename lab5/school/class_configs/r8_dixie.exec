@@ -1,0 +1,7 @@
+# Origin: per-router config shared with my lab section by a classmate, used with their
+# permission. Not my work. Only the interface lines are kept: the Lab 4 static routes
+# were removed, because in Lab 5 RIP learns the routes by itself.
+echo 1 > /proc/sys/net/ipv4/ip_forward
+/sbin/ifconfig eth0 10.2.1.1 netmask 255.255.255.0 up
+/sbin/ifconfig eth1 10.2.2.2 netmask 255.255.255.0 up
+/sbin/ifconfig eth2 down
