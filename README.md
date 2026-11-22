@@ -10,6 +10,7 @@ Disclaimer: Personal study copies, for my own understanding only. Not for submis
 |---|---|---|
 | Lab 2 | TCP Hello server and client | [lab2/](lab2/) |
 | Lab 3 | TCP file download server and client | [lab3/](lab3/) |
+| Lab 5 | RIP network: convergence and failover | [lab5/](lab5/) |
 
 Some labs have a `school/` folder (the version built for the school's Fedora lab VMs) and a `homelab/` folder (my replication on my own network); labs without a homelab version keep their own layout.
 
